@@ -1,4 +1,4 @@
-/* Return Scanner: scan a parcel, record its opening, save the video and a small record to OneDrive. */
+/* Return Scanner: scan a parcel, mark it Received OK or Wrong return, and for wrong returns take the 6 claim photos. Saves a small record and the photos to OneDrive. Videos come from Myntra's VMS, not this app. */
 (function(){
 "use strict";
 const CFG=window.SCANNER_CONFIG||{};
@@ -7,8 +7,8 @@ const GRAPH=TEST?TEST.graph:"https://graph.microsoft.com/v1.0";
 const SCOPES=["Files.ReadWrite.All"];
 const MYNTRA=/^(MYER|MYEC|MYEP)\d{8,}$/, FLIPKART=/^FMP[A-Z]\d{8,}$/, TYPED=/^[A-Z0-9-]{6,40}$/;
 const ISSUES=["Wrong item (my own product)","Other seller's product","Used, damaged or stained","Missing part","Tag or label removed","Short or empty box"];
-const CHUNK=327680*16; /* 5 MiB; Graph needs multiples of 320 KiB */
-const MIN_REC_SECONDS=3;
+const CHUNK=327680*16; /* 5 MiB; only for videos queued by the old version, still on a phone */
+const VERSION="3";
 const WRONG_DIR="Wrong returns";
 const PHOTO_STEPS=[
   {k:"label",t:"Return label",h:"The whole label with the MYER barcode, flat, sharp and readable."},
@@ -72,6 +72,7 @@ async function tx(mode,fn){ const d=await db(); return new Promise((res,rej)=>{ 
 const qPut=i=>tx("readwrite",s=>s.put(i)), qDel=id=>tx("readwrite",s=>s.delete(id)), qAll=()=>tx("readonly",s=>s.getAll());
 async function refreshQueue(){ S.queue=(await qAll()).sort((a,b)=>a.at<b.at?-1:1); }
 
+/* Version 1 recorded videos. A phone may still hold one in its queue, so it is uploaded as before. */
 async function uploadVideo(item,f){
   /* Pick a free name so nothing is overwritten: BARCODE.mp4, then BARCODE_2.mp4 */
   if(!item.file){
@@ -102,13 +103,13 @@ async function uploadFile(item,f){
   /* Photos and the claim file are small, so a single PUT; a retake replaces the earlier file. */
   const r=await g(itemPath(f,item.path)+"/content",{method:"PUT",headers:{"Content-Type":item.blob.type||"application/octet-stream"},body:item.blob});
   if(!r.ok) throw new Error("OneDrive answered "+r.status);
-  if(item.kind==="claim"){ S.done=[{barcode:item.barcode,file:item.barcode,result:"photos",at:item.at}].concat(S.done).slice(0,20); store.set("done",S.done); }
+  if(item.kind==="claim"||item.kind==="record"){ S.done=[{barcode:item.barcode,file:item.barcode,result:item.kind==="claim"?"photos":item.result,at:item.at}].concat(S.done).slice(0,20); store.set("done",S.done); }
   await qDel(item.id);
-  if(item.kind==="claim"&&S.view==="home") render();
+  if((item.kind==="claim"||item.kind==="record")&&S.view==="home") render();
 }
 async function uploadItem(item){
   const f=await getFolder();
-  if(item.kind==="photo"||item.kind==="claim") return uploadFile(item,f);
+  if(item.kind) return uploadFile(item,f);
   if(!item.driveItem){ const d=await uploadVideo(item,f); item.driveItem={webUrl:d.webUrl,size:d.size}; await qPut(item); }
   const rec=Object.assign({},item.record,{file:item.file,webUrl:item.driveItem.webUrl,size:item.driveItem.size});
   const r=await g(itemPath(f,"_records/"+item.file+".json")+"/content",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(rec,null,1)});
@@ -171,62 +172,36 @@ function chooseBarcode(code){
 function daysSince(s){ if(!s) return null; const d=new Date(String(s).slice(0,10)+"T00:00:00"); return Math.floor((Date.now()-d.getTime())/864e5); }
 function parcelNotes(){
   const out=[], code=S.barcode, L=S.lines, limit=CFG.claimLimitDays||7;
-  if(FLIPKART.test(code)) out.push(["bad","This isn't a Myntra parcel. A video can be saved, but the ledger won't change."]);
-  else if(!L.length) out.push(["warn",S.index?"Not found in the ledger yet. This can happen if the report is a day behind. You can still record, and it will be matched later.":"The order list hasn't loaded yet. You can still record, and it will be matched later."]);
+  if(FLIPKART.test(code)) out.push(["bad","This isn't a Myntra parcel. The result can be saved, but the ledger won't change."]);
+  else if(!L.length) out.push(["warn",S.index?"Not found in the ledger yet. This can happen if the report is a day behind. You can still save the result, and it will be matched later.":"The order list hasn't loaded yet. You can still save the result, and it will be matched later."]);
   const stages=new Set(L.map(l=>l.stage));
-  if(stages.has("raised")) out.push(["warn","A claim is already raised for this parcel. A new video will be added, but the ledger status won't change."]);
-  if(stages.has("ok")||stages.has("accepted")||stages.has("rejected")) out.push(["warn","This parcel is already closed in the ledger. A new video will be added, but the status won't change."]);
+  if(stages.has("raised")) out.push(["warn","A claim is already raised for this parcel. A new result will be noted, but the ledger status won't change."]);
+  if(stages.has("ok")||stages.has("accepted")||stages.has("rejected")) out.push(["warn","This parcel is already closed in the ledger. A new result will be noted, but the status won't change."]);
   if(stages.has("wrong")) out.push(["warn","This parcel is already marked wrong and waiting for a claim."]);
-  if(S.done.some(d=>d.barcode===code)||S.queue.some(q=>q.barcode===code)) out.push(["warn","A video for this barcode was already recorded on this device. A new one will be saved as a separate file."]);
+  if(S.done.some(d=>d.barcode===code)||S.queue.some(q=>q.barcode===code)) out.push(["warn","This barcode was already scanned on this device."]);
   const back=L.map(l=>l.backAt).filter(Boolean)[0];
-  if(back){ const left=limit-daysSince(back); out.push(left<0?["bad","Past Myntra's "+limit+"-day claim limit by "+(-left)+" day"+(left===-1?"":"s")+". Open it on video anyway."]:left===0?["bad","Last day to raise a claim for this parcel."]:left<=3?["warn",left+" day"+(left===1?"":"s")+" left to raise a claim."]:["good",left+" days left to raise a claim."]); }
+  if(back){ const left=limit-daysSince(back); out.push(left<0?["bad","Past Myntra's "+limit+"-day claim limit by "+(-left)+" day"+(left===-1?"":"s")+"."]:left===0?["bad","Last day to raise a claim for this parcel."]:left<=3?["warn",left+" day"+(left===1?"":"s")+" left to raise a claim."]:["good",left+" days left to raise a claim."]); }
   return out;
 }
 
-/* ---------- recording ---------- */
-function pickMime(){ const list=["video/mp4;codecs=avc1.42E01E,mp4a.40.2","video/mp4","video/webm;codecs=vp9,opus","video/webm;codecs=vp8,opus","video/webm"]; return list.find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||""; }
-async function openRecordStream(){
-  const video={facingMode:{ideal:"environment"},width:{ideal:1280},height:{ideal:720}};
-  try{ return await navigator.mediaDevices.getUserMedia({video,audio:true}); }
-  catch(e){ if(e.name==="NotAllowedError"||e.name==="NotFoundError"){ return navigator.mediaDevices.getUserMedia({video,audio:false}); } throw e; }
-}
-let tick=null, wake=null;
-async function startRecording(){
-  if(!window.MediaRecorder||!pickMime()){ toast("This browser can't record video. Update it, or use Chrome or Safari."); return; }
-  S.view="record"; S.rec={chunks:[],started:0,result:null,interrupted:false}; render();
-  try{ stream=await openRecordStream(); }
-  catch(e){ S.view="confirm"; S.rec=null; toast(camError(e)); render(); return; }
-  const v=$("#cam"); v.srcObject=stream; await v.play().catch(()=>{});
-  const mime=pickMime(); let rec;
-  try{ rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:2500000}); }catch(e){ rec=new MediaRecorder(stream); }
-  S.rec.recorder=rec; S.rec.mime=rec.mimeType||mime;
-  rec.ondataavailable=e=>{ if(e.data&&e.data.size) S.rec.chunks.push(e.data); };
-  rec.onstop=finishRecording;
-  stream.getVideoTracks()[0].onended=()=>{ if(S.rec&&!S.rec.result&&rec.state!=="inactive"){ S.rec.interrupted=true; rec.stop(); } };
-  rec.start(3000); S.rec.started=Date.now();
-  try{ if(navigator.wakeLock) wake=await navigator.wakeLock.request("screen"); }catch(e){}
-  tick=setInterval(()=>{ const s=Math.floor((Date.now()-S.rec.started)/1000), t=$("#timer"); if(t) t.textContent=Math.floor(s/60)+":"+String(s%60).padStart(2,"0"); document.querySelectorAll("[data-result]").forEach(b=>{ b.disabled=s<MIN_REC_SECONDS; }); },500);
-}
-function stopRecording(result){ const r=S.rec; if(!r||!r.recorder||r.recorder.state==="inactive") return; r.result=result; r.recorder.stop(); }
-function cancelRecording(){ if(!confirm("Discard this video?")) return; const r=S.rec; S.rec=null; cleanRec(); if(r&&r.recorder&&r.recorder.state!=="inactive"){ r.recorder.onstop=null; r.recorder.stop(); } S.view="confirm"; render(); }
-function cleanRec(){ clearInterval(tick); tick=null; stopStream(); if(wake){ wake.release().catch(()=>{}); wake=null; } }
-function finishRecording(){
-  const r=S.rec; if(!r) return; cleanRec();
-  r.seconds=Math.round((Date.now()-r.started)/1000); r.blob=new Blob(r.chunks,{type:(r.mime||"video/webm").split(";")[0]}); r.chunks=null; r.ext=(r.mime||"").includes("mp4")?"mp4":"webm";
+/* ---------- result: Received OK or Wrong return ---------- */
+function chooseResult(result){
   const entries=S.lines.length?S.lines:[{l:"",sku:"",size:"",o:""}];
-  r.items=entries.map(x=>({l:x.l,o:x.o,sku:x.sku,size:x.size,result:r.result||"",issue:""}));
-  if(r.result==="ok"&&r.items.length===1){ return saveResult(); }
+  S.rec={items:entries.map(x=>({l:x.l,o:x.o,sku:x.sku,size:x.size,result,issue:""}))};
+  if(result==="ok"&&S.rec.items.length===1) return saveResult();
   S.view="items"; render();
 }
 async function saveResult(){
   const r=S.rec, overall=r.items.some(i=>i.result==="wrong")?"wrong":"ok", at=new Date().toISOString();
-  const record={v:1,barcode:S.barcode,result:overall,by:S.who,at,seconds:r.seconds,mime:r.mime,interrupted:!!r.interrupted,device:navigator.userAgent.slice(0,120),items:r.items.map(i=>({line:i.l,order:i.o,sku:i.sku,result:i.result,issue:i.result==="wrong"?i.issue:""}))};
-  const item={id:at+"-"+Math.random().toString(36).slice(2,8),barcode:S.barcode,ext:r.ext,blob:r.blob,at,record,file:null,offset:0};
+  /* "file" is this scan's unique name; the ledger sync uses it to avoid counting a scan twice */
+  const file=S.barcode+"_"+at.replace(/[-:.Z]/g,"")+Math.random().toString(36).slice(2,5)+".scan";
+  const record={v:3,barcode:S.barcode,file,result:overall,by:S.who,at,device:navigator.userAgent.slice(0,120),items:r.items.map(i=>({line:i.l,order:i.o,sku:i.sku,result:i.result,issue:i.result==="wrong"?i.issue:""}))};
+  const item={id:at+"-"+Math.random().toString(36).slice(2,8),kind:"record",result:overall,barcode:S.barcode,name:S.barcode+(overall==="ok"?" · OK":" · wrong"),path:"_records/"+file+".json",blob:new Blob([JSON.stringify(record,null,1)],{type:"application/json"}),at};
   try{ await qPut(item); }
-  catch(e){ toast("Could not save the video on this device. Free up storage and record again."); return; }
+  catch(e){ toast("Could not save on this device. Free up storage and try again."); return; }
   S.rec=null; await refreshQueue(); pump();
-  if(overall==="wrong"){ startPhotos(S.barcode,record.items); toast("Video saved. Now take the 6 claim photos."); return; }
-  S.view="home"; toast("Saved as received OK. Uploading now."); render();
+  if(overall==="wrong"){ startPhotos(S.barcode,record.items); toast("Marked as a wrong return. Now take the 6 claim photos."); return; }
+  S.view="home"; toast("Saved as received OK."); render();
 }
 
 /* ---------- claim photos: label + 5 product photos into Wrong returns/BARCODE/images ---------- */
@@ -288,10 +263,9 @@ async function paintQueue(){ const q=$("#queue"); if(q) q.innerHTML=queueHtml();
 function render(){
   const v=S.view;
   if(v==="scan"){ app.innerHTML=`<div class="cam"><video id="cam" playsinline muted autoplay></video><div class="guide"></div><div class="top"><div id="scanMsg">${esc(S.scanMsg)}</div></div><div class="bottom"><div class="row"><button data-a="scanCancel">Cancel</button><button id="torch" data-a="torch" hidden>Light</button></div></div></div>`; return; }
-  if(v==="record"){ app.innerHTML=`<div class="cam"><video id="cam" playsinline muted autoplay></video><div class="top"><div class="big"><span class="dot"></span><span id="timer">0:00</span></div><div class="mono">${esc(S.barcode)}</div><div>Show the label first, then open the parcel.</div></div><div class="bottom"><div class="row" style="margin-bottom:10px"><button class="good tall" data-a="stop" data-result="ok" disabled>Received OK</button><button class="bad tall" data-a="stop" data-result="wrong" disabled>Wrong return</button></div><button class="wide" data-a="recCancel">Discard video</button></div></div>`; return; }
   if(v==="confirm"){
     const wrongHere=S.lines.some(l=>l.stage==="wrong")||S.done.some(d=>d.barcode===S.barcode&&d.result==="wrong")||S.jobs[S.barcode];
-    app.innerHTML=`<h1>Confirm parcel</h1><div class="card"><div class="big mono">${esc(S.barcode)}</div>${S.lines.map(l=>`<p class="muted" style="margin:8px 0 0">${esc(l.sku)}${l.size?" · Size "+esc(l.size):""}<br>Order ${esc(l.o)}${l.kind?" · "+esc(l.kind):""}</p>`).join("")}</div>${notesHtml(parcelNotes())}<button class="primary wide tall" data-a="record">Start video</button><div style="height:10px"></div>${wrongHere?`<button class="wide" data-a="photosOnly">Take claim photos only (video already done)</button><div style="height:10px"></div>`:""}<button class="wide" data-a="home">Scan a different parcel</button>`; return;
+    app.innerHTML=`<h1>Confirm parcel</h1><div class="card"><div class="big mono">${esc(S.barcode)}</div>${S.lines.map(l=>`<p class="muted" style="margin:8px 0 0">${esc(l.sku)}${l.size?" · Size "+esc(l.size):""}<br>Order ${esc(l.o)}${l.kind?" · "+esc(l.kind):""}</p>`).join("")}</div>${notesHtml(parcelNotes())}<p class="muted">Open the parcel at the VMS station, then choose:</p><div class="row" style="margin-bottom:10px"><button class="good tall" data-a="result" data-v="ok">Received OK</button><button class="bad tall" data-a="result" data-v="wrong">Wrong return</button></div>${wrongHere?`<button class="wide" data-a="photosOnly">Take claim photos only (already marked wrong)</button><div style="height:10px"></div>`:""}<button class="wide" data-a="home">Scan a different parcel</button>`; return;
   }
   if(v==="photos"){
     const j=S.pj, st=PHOTO_STEPS[j.step], job=S.jobs[j.barcode]||{done:{}};
@@ -306,18 +280,19 @@ function render(){
   }
   if(v==="items"){
     const r=S.rec, ready=r.items.every(i=>i.result==="ok"||(i.result==="wrong"&&i.issue));
-    app.innerHTML=`<h1>Result for ${esc(S.barcode)}</h1>${r.interrupted?`<div class="note warn">The recording was interrupted, so check the video covers the opening. If it doesn't, save this and record again.</div>`:""}${r.items.map((it,n)=>`<div class="card"><p>${it.sku?esc(it.sku)+(it.size?" · Size "+esc(it.size):""):"This parcel"}</p><div class="row" style="margin-bottom:${it.result==="wrong"?"10px":"0"}"><button class="${it.result==="ok"?"good":""}" data-a="set" data-n="${n}" data-v="ok" aria-pressed="${it.result==="ok"}">Received OK</button><button class="${it.result==="wrong"?"bad":""}" data-a="set" data-n="${n}" data-v="wrong" aria-pressed="${it.result==="wrong"}">Wrong</button></div>${it.result==="wrong"?`<label for="iss${n}">What's wrong?</label><select id="iss${n}" data-issue="${n}"><option value="">Choose one</option>${ISSUES.map(x=>`<option${it.issue===x?" selected":""}>${esc(x)}</option>`).join("")}</select>`:""}</div>`).join("")}<button class="primary wide tall" data-a="save"${ready?"":" disabled"}>Save</button>`; return;
+    app.innerHTML=`<h1>Result for ${esc(S.barcode)}</h1>${r.items.map((it,n)=>`<div class="card"><p>${it.sku?esc(it.sku)+(it.size?" · Size "+esc(it.size):""):"This parcel"}</p><div class="row" style="margin-bottom:${it.result==="wrong"?"10px":"0"}"><button class="${it.result==="ok"?"good":""}" data-a="set" data-n="${n}" data-v="ok" aria-pressed="${it.result==="ok"}">Received OK</button><button class="${it.result==="wrong"?"bad":""}" data-a="set" data-n="${n}" data-v="wrong" aria-pressed="${it.result==="wrong"}">Wrong</button></div>${it.result==="wrong"?`<label for="iss${n}">What's wrong?</label><select id="iss${n}" data-issue="${n}"><option value="">Choose one</option>${ISSUES.map(x=>`<option${it.issue===x?" selected":""}>${esc(x)}</option>`).join("")}</select>`:""}</div>`).join("")}<button class="primary wide tall" data-a="save"${ready?"":" disabled"}>Save</button><div style="height:10px"></div><button class="wide" data-a="home">Cancel</button>`; return;
   }
   const idx=S.index&&S.index.at?new Date(S.index.at):null;
-  if(!TEST&&!account){ app.innerHTML=`<h1>Return Scanner</h1><div class="card"><p>Sign in with the Store Chikankari Microsoft account to save videos to OneDrive.</p><button class="primary wide" data-a="signin">Sign in</button></div>`; return; }
-  app.innerHTML=`<h1>Return Scanner</h1>${S.authError?`<div class="note bad">${esc(S.authError)}. Your videos are safe on this device. <button data-a="signin" style="margin-top:8px">Sign in again</button></div>`:""}
+  if(!TEST&&!account){ app.innerHTML=`<h1>Return Scanner</h1><div class="card"><p>Sign in with the Store Chikankari Microsoft account to save results and claim photos to OneDrive.</p><button class="primary wide" data-a="signin">Sign in</button></div>`; return; }
+  app.innerHTML=`<h1>Return Scanner</h1>${S.authError?`<div class="note bad">${esc(S.authError)}. Your results and photos are safe on this device. <button data-a="signin" style="margin-top:8px">Sign in again</button></div>`:""}
   <div class="card"><label for="who">Who is opening parcels?</label><select id="who"><option value="">Choose your name</option>${(CFG.people||[]).map(p=>`<option${S.who===p?" selected":""}>${esc(p)}</option>`).join("")}</select></div>
   <button class="primary wide tall" data-a="scan"${S.who?"":" disabled"}>Scan a parcel</button>
   <h2>Barcode won't scan?</h2><form id="typed" class="row"><input id="code" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="MYER1073035663" aria-label="Type the barcode number" value="${esc(S.typed)}"><button type="submit" style="flex:0 0 auto"${S.who?"":" disabled"}>Continue</button></form>
   ${Object.keys(S.jobs).length?`<h2>Claim photos to finish</h2><div class="card">${Object.values(S.jobs).map(j=>`<div class="q" style="align-items:center"><span class="mono">${esc(j.barcode)}</span><button data-a="photoResume" data-b="${esc(j.barcode)}" style="flex:0 0 auto">${Object.keys(j.done).length} of 6 · Continue</button></div>`).join("")}</div>`:""}
   <div id="queue">${queueHtml()}</div>
   ${S.done.length?`<h2>Recently saved</h2><div class="card">${S.done.slice(0,8).map(d=>`<div class="q"><span class="mono">${esc(d.file)}</span><span class="muted">${d.result==="ok"?"Received OK":d.result==="photos"?"6 claim photos":"Wrong return"}</span></div>`).join("")}</div>`:""}
-  <p class="muted" style="margin-top:14px">${idx?"Order list updated "+esc(idx.toLocaleString())+".":"Order list not loaded yet."} Saved videos reach the ledger within a few hours.</p>`;
+  <p class="muted" style="margin-top:14px">${idx?"Order list updated "+esc(idx.toLocaleString())+".":"Order list not loaded yet."} Results reach the ledger within a few hours.</p>
+  <p class="muted">Version ${VERSION} · no video (VMS records it) · wrong returns take 6 claim photos.</p>`;
 }
 document.addEventListener("click",e=>{
   const b=e.target.closest("[data-a]"); if(!b||b.disabled) return; const a=b.dataset.a;
@@ -326,9 +301,7 @@ document.addEventListener("click",e=>{
   else if(a==="scanCancel"){ stopStream(); S.view="home"; render(); }
   else if(a==="torch") toggleTorch();
   else if(a==="home"){ S.view="home"; render(); }
-  else if(a==="record") startRecording();
-  else if(a==="stop") stopRecording(b.dataset.result);
-  else if(a==="recCancel") cancelRecording();
+  else if(a==="result") chooseResult(b.dataset.v);
   else if(a==="set"){ const it=S.rec.items[+b.dataset.n]; it.result=b.dataset.v; if(it.result==="ok") it.issue=""; render(); }
   else if(a==="save") saveResult();
   else if(a==="photosOnly") startPhotos(S.barcode,S.lines.map(l=>({l:l.l,o:l.o,sku:l.sku,result:"wrong",issue:""})));
@@ -344,7 +317,6 @@ document.addEventListener("change",e=>{
 });
 document.addEventListener("input",e=>{ if(e.target.id==="code") S.typed=e.target.value; });
 document.addEventListener("submit",e=>{ if(e.target.id!=="typed") return; e.preventDefault(); const c=(S.typed||"").trim().toUpperCase(); if(!TYPED.test(c)){ toast("Type the number under the barcode, such as MYER1073035663."); return; } S.typed=""; chooseBarcode(c); });
-window.addEventListener("beforeunload",e=>{ if(S.view==="record"){ e.preventDefault(); e.returnValue=""; } });
 
 (async function start(){
   try{ await initAuth(); }catch(e){ app.innerHTML=`<div class="note bad">${esc(e.message||e)}</div>`; return; }
