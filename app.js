@@ -8,7 +8,7 @@ const SCOPES=["Files.ReadWrite.All"];
 const MYNTRA=/^(MYER|MYEC|MYEP)\d{8,}$/, FLIPKART=/^FMP[A-Z]\d{8,}$/, TYPED=/^[A-Z0-9-]{6,40}$/;
 const ISSUES=["Wrong item (my own product)","Other seller's product","Used, damaged or stained","Missing part","Tag or label removed","Short or empty box"];
 const CHUNK=327680*16; /* 5 MiB; only for videos queued by the old version, still on a phone */
-const VERSION="3";
+const VERSION="3.1";
 const WRONG_DIR="Wrong returns";
 const PHOTO_STEPS=[
   {k:"label",t:"Return label",h:"The whole label with the MYER barcode, flat, sharp and readable."},
@@ -21,6 +21,8 @@ const photoName=(bc,k)=>bc+"_"+k+".jpg";
 const $=s=>document.querySelector(s), app=$("#app");
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+/* Phones pause a page in the background; a request or storage call can then hang forever. Everything that can hang gets a time limit. */
+const withTimeout=(p,ms,msg)=>new Promise((res,rej)=>{ const t=setTimeout(()=>rej(Object.assign(new Error(msg||"Timed out"),{timeout:true})),ms); Promise.resolve(p).then(v=>{clearTimeout(t);res(v);},e=>{clearTimeout(t);rej(e);}); });
 const store={get(k,d){try{const v=localStorage.getItem(k);return v==null?d:JSON.parse(v);}catch(e){return d;}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch(e){}}};
 const S={view:"home",who:store.get("who",""),index:store.get("index",null),done:store.get("done",[]),jobs:store.get("photoJobs",{}),pj:null,queue:[],barcode:"",lines:[],rec:null,authError:"",pumping:false,typed:""};
 
@@ -38,12 +40,15 @@ function signIn(){ return pca.loginRedirect({scopes:SCOPES}); }
 async function token(){
   if(TEST) return "test";
   if(!account) throw Object.assign(new Error("Not signed in"),{auth:true});
-  try{ return (await pca.acquireTokenSilent({scopes:SCOPES,account})).accessToken; }
-  catch(e){ throw Object.assign(new Error("Microsoft sign-in has expired"),{auth:true}); }
+  try{ return (await withTimeout(pca.acquireTokenSilent({scopes:SCOPES,account}),30000,"Sign-in check took too long, retrying")).accessToken; }
+  catch(e){ if(e.timeout) throw e; throw Object.assign(new Error("Microsoft sign-in has expired"),{auth:true}); }
 }
 async function g(path,opts){
   const o=opts||{}; const headers=Object.assign({Authorization:"Bearer "+await token()},o.headers||{});
-  return fetch(GRAPH+path,Object.assign({},o,{headers}));
+  const ac=new AbortController(); const t=setTimeout(()=>ac.abort(),o.timeout||60000);
+  try{ return await fetch(GRAPH+path,Object.assign({},o,{headers,signal:ac.signal})); }
+  catch(e){ if(e&&e.name==="AbortError") throw new Error("Upload took too long, retrying"); throw e; }
+  finally{ clearTimeout(t); }
 }
 
 /* ---------- OneDrive folder ---------- */
@@ -67,8 +72,10 @@ async function loadIndex(){
 
 /* ---------- saved queue, kept on the device until OneDrive confirms ---------- */
 let dbp=null;
-function db(){ return dbp||(dbp=new Promise((res,rej)=>{ const q=indexedDB.open("return-scanner",1); q.onupgradeneeded=()=>q.result.createObjectStore("queue",{keyPath:"id"}); q.onsuccess=()=>res(q.result); q.onerror=()=>rej(q.error); })); }
-async function tx(mode,fn){ const d=await db(); return new Promise((res,rej)=>{ const t=d.transaction("queue",mode); const r=fn(t.objectStore("queue")); t.oncomplete=()=>res(r&&r.result); t.onerror=()=>rej(t.error); t.onabort=()=>rej(t.error); }); }
+function db(){ return dbp||(dbp=new Promise((res,rej)=>{ const q=indexedDB.open("return-scanner",1); q.onupgradeneeded=()=>q.result.createObjectStore("queue",{keyPath:"id"}); q.onsuccess=()=>{ const d=q.result; d.onclose=()=>{ dbp=null; }; d.onversionchange=()=>{ d.close(); dbp=null; }; res(d); }; q.onerror=()=>{ dbp=null; rej(q.error); }; })); }
+async function txOnce(mode,fn){ const d=await withTimeout(db(),10000,"Device storage not responding"); return withTimeout(new Promise((res,rej)=>{ const t=d.transaction("queue",mode); const r=fn(t.objectStore("queue")); t.oncomplete=()=>res(r&&r.result); t.onerror=()=>rej(t.error); t.onabort=()=>rej(t.error); }),10000,"Device storage not responding"); }
+/* After the phone wakes the page, the storage connection can be dead: reopen it once and retry. */
+async function tx(mode,fn){ try{ return await txOnce(mode,fn); }catch(e){ dbp=null; return txOnce(mode,fn); } }
 const qPut=i=>tx("readwrite",s=>s.put(i)), qDel=id=>tx("readwrite",s=>s.delete(id)), qAll=()=>tx("readonly",s=>s.getAll());
 async function refreshQueue(){ S.queue=(await qAll()).sort((a,b)=>a.at<b.at?-1:1); }
 
@@ -101,7 +108,7 @@ async function uploadVideo(item,f){
 }
 async function uploadFile(item,f){
   /* Photos and the claim file are small, so a single PUT; a retake replaces the earlier file. */
-  const r=await g(itemPath(f,item.path)+"/content",{method:"PUT",headers:{"Content-Type":item.blob.type||"application/octet-stream"},body:item.blob});
+  const r=await g(itemPath(f,item.path)+"/content",{method:"PUT",timeout:120000,headers:{"Content-Type":item.blob.type||"application/octet-stream"},body:item.blob});
   if(!r.ok) throw new Error("OneDrive answered "+r.status);
   if(item.kind==="claim"||item.kind==="record"){ S.done=[{barcode:item.barcode,file:item.barcode,result:item.kind==="claim"?"photos":item.result,at:item.at}].concat(S.done).slice(0,20); store.set("done",S.done); }
   await qDel(item.id);
@@ -117,21 +124,35 @@ async function uploadItem(item){
   S.done=[{barcode:item.barcode,file:item.file,result:item.record.result,at:item.at}].concat(S.done).slice(0,20); store.set("done",S.done);
   await qDel(item.id);
 }
+/* One upload loop at a time. If a loop stops answering (phone paused it), a newer one takes over. */
+let pumpGen=0, pumpBeat=0;
 async function pump(){
-  if(S.pumping) return; S.pumping=true;
+  if(S.pumping&&Date.now()-pumpBeat<180000) return;
+  const gen=++pumpGen; S.pumping=true; pumpBeat=Date.now();
   try{
     let delay=0;
-    while(true){
+    while(gen===pumpGen){
+      pumpBeat=Date.now();
       await refreshQueue(); await paintQueue();
       /* the claim file goes last, once every photo of that parcel is in OneDrive */
       const item=S.queue.find(i=>(!i.waitUntil||i.waitUntil<=Date.now())&&!(i.kind==="claim"&&S.queue.some(p=>p.kind==="photo"&&p.barcode===i.barcode)));
       if(!item){ if(!S.queue.length) break; await sleep(4000); continue; }
-      try{ item.error=""; await qPut(item); await paintQueue(); await uploadItem(item); delay=0; S.authError=""; }
+      try{ item.error=""; S.activeId=item.id; await qPut(item); await paintQueue(); await uploadItem(item); delay=0; if(S.authError){ S.authError=""; if(S.view==="home") render(); } }
       catch(e){ if(e.auth){ S.authError=e.message; if(S.view==="home") render(); break; } delay=Math.min((delay||15000)*2,300000); item.error=navigator.onLine?e.message:"Waiting for internet"; item.waitUntil=Date.now()+delay; await qPut(item); }
+      finally{ S.activeId=null; }
     }
-  }finally{ S.pumping=false; await refreshQueue(); await paintQueue(); }
+  }finally{ if(gen===pumpGen){ S.pumping=false; S.activeId=null; try{ await refreshQueue(); }catch(e){} await paintQueue(); } }
 }
-window.addEventListener("online",()=>{ qAll().then(a=>Promise.all(a.map(i=>{ i.waitUntil=0; return qPut(i); }))).then(pump); });
+/* Start uploading again the moment the page is back on screen, the internet returns, or every 20 seconds while open. */
+function kick(){
+  if(!(TEST||account)) return;
+  qAll().then(a=>Promise.all(a.filter(i=>i.waitUntil).map(i=>{ i.waitUntil=0; return qPut(i); }))).catch(()=>{}).then(()=>pump());
+}
+window.addEventListener("online",kick);
+window.addEventListener("pageshow",kick);
+window.addEventListener("focus",kick);
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible") kick(); });
+setInterval(()=>{ if((TEST||account)&&document.visibilityState==="visible") pump(); },20000);
 
 /* ---------- barcode reading ---------- */
 let wasmReady=false;
@@ -257,7 +278,7 @@ function toast(m){ let t=$(".toast"); if(!t){ t=document.createElement("div"); t
 function notesHtml(n){ return n.map(([k,t])=>`<div class="note ${k}">${esc(t)}</div>`).join(""); }
 function queueHtml(){
   if(!S.queue.length) return "";
-  return `<h2>Waiting to upload: keep this page open</h2><div class="card">${S.queue.map(i=>`<div class="q"><span class="mono">${esc(i.name||i.barcode)}</span><span class="muted">${i.error?esc(i.error):i.pct?i.pct+"%":"In line"}</span></div>`).join("")}</div>`;
+  return `<h2>Waiting to upload: keep this page open</h2><div class="card">${S.queue.map(i=>`<div class="q"><span class="mono">${esc(i.name||i.barcode)}</span><span class="muted">${i.id===S.activeId?(i.pct?i.pct+"%":"Uploading…"):i.error?esc(i.error):S.authError?"Sign in needed":"In line"}</span></div>`).join("")}</div>`;
 }
 async function paintQueue(){ const q=$("#queue"); if(q) q.innerHTML=queueHtml(); }
 function render(){
